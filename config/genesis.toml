@@ -1,0 +1,22 @@
+environment = "Live"
+
+[refdata]
+dir = "/var/lib/new_genesis/refdata"
+max_age_hours = 48
+
+[runtime]
+stale_timeout_ms = 30000                # no bytes this long -> reconnect
+
+# venue      = BINANCE_SPOT | BITSTAMP_SPOT
+# instrument = canonical BASE/QUOTE (spot)
+# data       = quote | trade | delta | snapshotN (Binance: snapshot20)
+
+[[feed]]
+venue = "BINANCE_SPOT"
+instrument = "BTC/USDT"
+data = ["quote", "trade"]
+
+[[feed]]
+venue = "BITSTAMP_SPOT"
+instrument = "BTC/USDT"
+data = ["trade"]

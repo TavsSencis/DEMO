@@ -1,0 +1,32 @@
+# Data-plane guard. These are denied only in data-plane modules (`#![deny(...)]` in
+# src/data_plane/mod.rs, src/venues/decode.rs, src/venues/*/spot/decoder.rs,
+# src/venues/binance/spot/sbe/mod.rs and src/transport/ws/{reader,frame,writer}.rs); the crate
+# root allows them for the control plane.
+# A startup constructor inside a data-plane file opts out with an explicit
+# `#[allow(clippy::disallowed_methods, clippy::disallowed_macros)]`.
+
+disallowed-methods = [
+    { path = "std::vec::Vec::new", reason = "data plane: no heap allocation" },
+    { path = "std::vec::Vec::with_capacity", reason = "data plane: no heap allocation" },
+    { path = "std::vec::Vec::push", reason = "data plane: may reallocate" },
+    { path = "std::vec::Vec::extend_from_slice", reason = "data plane: may reallocate" },
+    { path = "std::boxed::Box::new", reason = "data plane: no heap allocation" },
+    { path = "std::sync::Arc::new", reason = "data plane: no heap allocation" },
+    { path = "std::string::String::new", reason = "data plane: no strings" },
+    { path = "std::string::ToString::to_string", reason = "data plane: no strings" },
+    { path = "std::borrow::ToOwned::to_owned", reason = "data plane: no owned copies" },
+    { path = "std::iter::Iterator::collect", reason = "data plane: collecting allocates" },
+    { path = "std::time::Instant::now", reason = "data plane: use sys::clock::tsc()" },
+    { path = "std::thread::sleep", reason = "data plane: never sleep" },
+    { path = "std::sync::Mutex::lock", reason = "data plane: no locks" },
+]
+
+disallowed-macros = [
+    { path = "std::format", reason = "data plane: formatting allocates" },
+    { path = "std::vec", reason = "data plane: no heap allocation" },
+    { path = "std::print", reason = "no printing (project rule)" },
+    { path = "std::println", reason = "no printing (project rule)" },
+    { path = "std::eprint", reason = "no printing (project rule)" },
+    { path = "std::eprintln", reason = "no printing (project rule)" },
+    { path = "std::dbg", reason = "no printing (project rule)" },
+]
