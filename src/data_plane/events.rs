@@ -2,7 +2,7 @@
 //! One event = one 64-byte cache line, written once into a per-connection SPSC ring.
 
 use crate::data_plane::spsc::{Consumer, Producer};
-use crate::control_plane::identity::FeedId;
+use crate::control_plane::identity::{InstrumentId, MarketId};
 
 /// Events per connection ring (64 B each -> 512 KiB). Sized so all rings stay cache-resident
 /// (6 connections = 3 MiB vs 12 MiB L3, 1.25 MiB L2 per core): a ring that wraps through
@@ -24,13 +24,15 @@ pub enum EventKind {
     BookSnapshot = 3,
     /// One level of a book delta. seq = last update id, aux0 = first update id.
     BookDelta = 4,
-    /// Feed lifecycle; aux0 = `FeedStatus` code. Consumers must drop book state on `Down`.
-    FeedStatus = 5,
+    /// Stream lifecycle; aux0 = `StreamStatus` code, aux1 = data-type slot of the stream.
+    /// Consumers use a market's data of that type only while it is `Up` and must drop book
+    /// state on `Down`.
+    StreamStatus = 5,
 }
 
 #[repr(i64)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FeedStatus {
+pub enum StreamStatus {
     /// Subscription confirmed by the venue on the current session (data that follows is continuous).
     Up = 1,
     /// Session ended; data stopped and may have gaps.
@@ -62,19 +64,21 @@ pub struct MdEvent {
     pub qty: i64,
     pub aux0: i64,
     pub aux1: i64,
-    pub feed: FeedId,
+    /// Venue + canonical instrument; index for per-market state.
+    pub market: MarketId,
+    /// Canonical instrument; groups the same instrument across venues.
+    pub instrument: InstrumentId,
     pub kind: EventKind,
     pub flags: u8,
     pub price_exp: i8,
     pub qty_exp: i8,
-    _pad: [u8; 2],
 }
 
 const _: () = assert!(core::mem::size_of::<MdEvent>() == 64);
 
 impl MdEvent {
     #[inline(always)]
-    pub const fn new(feed: FeedId, kind: EventKind, recv_tsc: u64) -> Self {
+    pub const fn new(market: MarketId, instrument: InstrumentId, kind: EventKind, recv_tsc: u64) -> Self {
         Self {
             recv_tsc,
             exch_ts_us: 0,
@@ -83,19 +87,27 @@ impl MdEvent {
             qty: 0,
             aux0: 0,
             aux1: 0,
-            feed,
+            market,
+            instrument,
             kind,
             flags: 0,
             price_exp: 0,
             qty_exp: 0,
-            _pad: [0; 2],
         }
     }
 
     #[inline]
-    pub fn status(feed: FeedId, status: FeedStatus, recv_tsc: u64) -> Self {
-        let mut e = Self::new(feed, EventKind::FeedStatus, recv_tsc);
+    /// Status change of one stream: the market's data of `data_type_slot`.
+    pub fn status(
+        market: MarketId,
+        instrument: InstrumentId,
+        data_type_slot: usize,
+        status: StreamStatus,
+        recv_tsc: u64,
+    ) -> Self {
+        let mut e = Self::new(market, instrument, EventKind::StreamStatus, recv_tsc);
         e.aux0 = status as i64;
+        e.aux1 = data_type_slot as i64;
         e
     }
 }

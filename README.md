@@ -2,6 +2,10 @@
 
 Low-latency, multi-venue crypto market-data connectivity in Rust.
 
+In its current stage the project consists of 80 Rust source files (about 5,100 lines) in 18
+directories, organised into five top-level modules: `control_plane`, `data_plane`, `venues`,
+`transport` and `sys`.
+
 Connects to several exchanges at once, each over its native protocol (binary SBE and JSON
 WebSocket today), subscribes to any number of configured instruments per venue, decodes every
 message into one fixed-size normalized event and hands it to a consumer through a lock-free
@@ -43,7 +47,7 @@ touching the rest of the pipeline.
 |---|---|---|
 | Transport (`transport/`) | bytes in, frames out | decoders, routing, events |
 | Venue protocol (`venues/<exchange>/<market>/`) | `Venue` trait + decoder over a payload slice | transport, resolver, runtime |
-| Routing and events (`data_plane/`) | `FeedId` + 64-byte `MdEvent` | venues, transport |
+| Routing and events (`data_plane/`) | `MarketId` + `InstrumentId` in a 64-byte `MdEvent` | venues, transport |
 | Configuration (`config/genesis.toml`) | venues, instruments, data types | any code |
 
 - **Multiple venues, multiple instruments at once.** Feeds are grouped into connections per
@@ -63,30 +67,36 @@ touching the rest of the pipeline.
 ## Architecture
 
 ```
-                     CONTROL PLANE (cold)
- ┌──────────────────────────────────────────────────────────────────┐
- │ config/genesis.toml ─► config_file ─► NodeConfig + Registry       │
- │ refdata-YYYY-MM-DD.json ─► venue instruments (symbol, exponents)  │
- │                                │                                  │
- │                             resolver ─► StartupPlan               │
- │                                │   feeds, connections, route keys,│
- │                                │   pre-built SUBSCRIBE frames     │
- │                             launch ─► one thread per connection   │
- │                                │                                  │
- │  supervisor: connect ─► session start ─► [hot loop] ─► reconnect  │
- │  subscriptions: send batches, acks, timeouts, retries             │
- └────────────────────────────────┼─────────────────────────────────┘
-                                  ▼
-                       DATA PLANE (hot, per message)
- ┌──────────────────────────────────────────────────────────────────┐
- │ socket read ─► WebSocket frame (in place) ─► venue decoder        │
- │   ─► route table (symbol/channel ─► slot) ─► routes[slot][type]   │
- │   ─► FeedId ─► active check ─► MdEvent (64 B) ─► SPSC ring        │
- │   ─► one publish per message                                      │
- └──────────────────────────────────────────────────────────────────┘
-                                  ▼
-                        consumer (strategy placeholder)
+                              GENESIS
+                                 │
+            ┌────────────────────┴────────────────────┐
+            │                                         │
+   CONTROL PLANE / RUNTIME                       DATA PLANE
+   cold: startup and per session                 hot: per message
+            │                                         │
+   config / refdata                              raw bytes
+   registry                                      decoder
+   resolver                                      routing
+   startup                                       MdEvent
+   lifecycle                                     SPSC ring
+            │                                         │
+            └────────────────────┬────────────────────┘
+                                 ▼
+                           BOOK ENGINE           planned
+                                 ▼
+                           STRATEGIES            planned
+                                 ▼
+                           RISK ENGINE           planned
+                                 ▼
+                            EXECUTION            planned
+                                 ▼
+                        VENUE ORDER ENTRY        planned
 ```
+
+This repository implements the two planes up to the SPSC ring; the layers below are the target
+design. The control plane resolves everything once (configuration, reference data, ids,
+connections, subscription frames) and then supervises connection lifecycles; the data plane
+only turns bytes into normalized events.
 
 ### From configuration to the first subscribe
 
@@ -112,7 +122,8 @@ touching the rest of the pipeline.
 |---|---|---|
 | `VenueId` | in code (`registry/venue.rs`) | one exchange market, e.g. an exchange's spot market |
 | `CurrencyId`, `InstrumentId` | at startup, from the config | canonical `BTC/USDT`, process-local |
-| `FeedId` | at startup, feed order in the config | (venue, instrument, data type); the only id the hot path sees |
+| `MarketId` | at startup, first appearance in the config | (venue, instrument); tags every event, indexes per-market state |
+| `StreamId` | at startup, order in the config | one subscribed stream (venue, instrument, data type); control plane only: subscribe, ack, `Up`/`Down`/`Failed` |
 
 Numeric ids are never written to disk. Files refer to venues and instruments by name, so an id
 can never point to the wrong instrument across restarts.
@@ -131,7 +142,10 @@ The route table is the single place where wire text becomes an id: a fixed 128-e
 open-addressing table built at startup, keys read with overlapping word loads, resident in L1.
 
 `MdEvent` is one 64-byte cache line: receive TSC, exchange time, sequence, price and quantity
-mantissas with their exponents, two auxiliary fields, feed id, kind and flags. Each connection
+mantissas with their exponents, two auxiliary fields, market id, instrument id, kind and flags.
+Events are tagged by market and instrument; the data type is the event kind. Stream status
+events (`Up`, `Down`, `Failed`) carry the same market and instrument plus the data type, and
+consumers use a market's data of a type only while that stream is `Up`. Each connection
 has its own single-producer/single-consumer ring of 8192 events.
 
 ## Repository layout
@@ -144,14 +158,16 @@ src/
 │   ├── configs_struct.rs                   configuration schema (NodeConfig, feeds, runtime)
 │   ├── identity                            process-local ids
 │   │   ├── currency_id.rs                  CurrencyId
-│   │   ├── feed_id.rs                      FeedId: the only id the hot path sees
-│   │   ├── instrument_id.rs                InstrumentId
+│   │   ├── instrument_id.rs                InstrumentId: canonical instrument, cross-venue group
+│   │   ├── market_id.rs                    MarketId: venue + instrument, tags every event
 │   │   ├── mod.rs
+│   │   ├── stream_id.rs                    StreamId: one subscription (control plane only)
 │   │   └── venue_id.rs                     VenueId
 │   ├── mod.rs
 │   ├── node.rs                             Node: build, run, shutdown
 │   ├── runtime                             while live, per session (cold)
 │   │   ├── mod.rs
+│   │   ├── stream_set.rs                   stream bitset (confirmed streams)
 │   │   ├── subscriptions.rs                subscribe batches, acks, timeouts, retries, rate limit
 │   │   └── supervisor.rs                   connection thread: connect, session, reconnect, backoff
 │   └── startup                             once, before any connection
@@ -179,7 +195,6 @@ src/
 ├── data_plane                              per message (hot)
 │   ├── decimal.rs                          decimal text -> fixed-point integer
 │   ├── events.rs                           MdEvent (64 B), EventOut, book framing
-│   ├── feed_set.rs                         active-feed bitset
 │   ├── json_scan.rs                        in-place JSON field scanning
 │   ├── mod.rs
 │   ├── route_table.rs                      symbol/channel bytes -> route slot
@@ -210,7 +225,7 @@ src/
     │   ├── dispatch.rs                     dispatch by market
     │   ├── mod.rs
     │   └── spot
-    │       ├── decoder.rs                  SBE message -> FeedId -> MdEvent
+    │       ├── decoder.rs                  SBE message -> market -> MdEvent
     │       ├── mod.rs
     │       ├── refdata.rs                  instrument list parser (REST)
     │       ├── sbe                         SBE schema decoders (zero-copy views)
@@ -226,7 +241,7 @@ src/
     │   ├── dispatch.rs                     dispatch by market
     │   ├── mod.rs
     │   └── spot
-    │       ├── decoder.rs                  JSON message -> FeedId -> MdEvent
+    │       ├── decoder.rs                  JSON message -> market -> MdEvent
     │       ├── mod.rs
     │       ├── refdata.rs                  instrument list parser (REST)
     │       └── venue.rs                    Venue impl: endpoints, channels, heartbeat

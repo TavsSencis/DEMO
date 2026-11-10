@@ -1,11 +1,12 @@
 //! [CONTROL PLANE] Per-connection subscription state, owned by the connection thread: sent,
-//! pending, confirmed; a feed is never confirmed from local send success alone.
+//! pending, confirmed; a stream is never confirmed from local send success alone. This is the
+//! only place that knows streams; the data plane tags events by market and instrument, and
+//! consumers gate a market's data type on the status events emitted here.
 //!
-//! - Every feed of the connection is subscribed on every session: the batched SUBSCRIBE
+//! - Every stream of the connection is subscribed on every session: the batched SUBSCRIBE
 //!   frames are built once at startup and replayed on each new session.
-//! - `active` = subscribe sent on this session (the decoder accepts data for these);
-//!   `confirmed` = acknowledged by the venue (`FeedStatus::Up`). Unconfirmed feeds fail after
-//!   `ACK_TIMEOUT` (`FeedStatus::Failed`). A failed feed's batch is sent again `RETRY_AFTER`
+//! - `confirmed` = acknowledged by the venue (`StreamStatus::Up`). Unconfirmed streams fail after
+//!   `ACK_TIMEOUT` (`StreamStatus::Failed`). A failed stream's batch is sent again `RETRY_AFTER`
 //!   later within the same session (and on every new session), so a rejected or lost
 //!   subscription does not wait for the next reconnect (up to 24 h on Binance).
 //! - A sliding-window limiter keeps requests under the venue limit. The clock is read only
@@ -14,32 +15,33 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-use crate::control_plane::identity::FeedId;
+use crate::control_plane::identity::{InstrumentId, MarketId, StreamId};
+use crate::control_plane::runtime::stream_set::StreamSet;
 use crate::control_plane::startup::resolver::{ConnectionPlan, StartupPlan};
-use crate::data_plane::events::{EventOut, FeedStatus, MdEvent};
-use crate::data_plane::feed_set::FeedSet;
+use crate::data_plane::events::{EventOut, MdEvent, StreamStatus};
 use crate::venues::{Ack, Venue};
 
 const ACK_TIMEOUT: Duration = Duration::from_secs(10);
 /// Pause before a failed batch is sent again within the session.
 const RETRY_AFTER: Duration = Duration::from_secs(30);
 
-/// One pre-built SUBSCRIBE frame, its request id and the feeds it covers.
+/// One pre-built SUBSCRIBE frame, its request id and the streams it covers.
 struct Batch {
     frame: Vec<u8>,
     id: u64,
-    feeds: Vec<FeedId>,
+    streams: Vec<StreamId>,
 }
 
 pub struct Subscriptions {
-    pub active: FeedSet,
-    confirmed: FeedSet,
+    confirmed: StreamSet,
+    /// Stream -> what its status events are tagged with (market, instrument, data-type slot).
+    status_tag: Vec<(MarketId, InstrumentId, usize)>,
     pending_since: Vec<Option<Instant>>,
     pending_count: usize,
     batches: Vec<Batch>,
     /// Index of the next batch to send on this session (`batches.len()` = all sent).
     next_batch: usize,
-    /// Feed -> index of the batch that subscribes it.
+    /// Stream -> index of the batch that subscribes it.
     batch_of: Vec<u32>,
     /// Per batch: when a failed batch is due to be sent again.
     retry_at: Vec<Option<Instant>>,
@@ -51,22 +53,27 @@ pub struct Subscriptions {
 
 impl Subscriptions {
     pub fn new<V: Venue>(plan: &StartupPlan, conn: &ConnectionPlan) -> Self {
-        let n = plan.feeds.len();
+        let n = plan.streams.len();
         let batches: Vec<Batch> = conn
-            .feeds
+            .streams
             .chunks(V::LIMITS.max_streams_per_request.max(1))
             .zip(1u64..)
             .map(|(chunk, id)| {
-                let streams: Vec<&str> = chunk.iter().map(|&f| plan.feed(f).stream.as_str()).collect();
-                Batch { frame: V::subscribe_request(&streams, id), id, feeds: chunk.to_vec() }
+                let names: Vec<&str> = chunk.iter().map(|&s| plan.stream(s).stream.as_str()).collect();
+                Batch { frame: V::subscribe_request(&names, id), id, streams: chunk.to_vec() }
             })
             .collect();
         let mut batch_of = vec![u32::MAX; n];
         for (b, batch) in batches.iter().enumerate() {
-            for f in &batch.feeds {
-                batch_of[f.index()] = b as u32;
+            for s in &batch.streams {
+                batch_of[s.index()] = b as u32;
             }
         }
+        let status_tag = plan
+            .streams
+            .iter()
+            .map(|s| (s.market, plan.market(s.market).instrument, s.data_type.slot()))
+            .collect();
         // One request of headroom under the venue limit.
         let per_sec = V::LIMITS.max_requests_per_sec.saturating_sub(1).max(1) as usize;
         Self {
@@ -74,8 +81,8 @@ impl Subscriptions {
             retry_at: vec![None; batches.len()],
             retry_scheduled: 0,
             retry_queue: VecDeque::with_capacity(batches.len()),
-            active: FeedSet::new(n),
-            confirmed: FeedSet::new(n),
+            confirmed: StreamSet::new(n),
+            status_tag,
             pending_since: vec![None; n],
             pending_count: 0,
             batches,
@@ -90,17 +97,22 @@ impl Subscriptions {
         self.next_batch = 0;
     }
 
-    /// Session ended: confirmed feeds go Down; everything session-scoped is cleared.
+    /// Session ended: confirmed streams go Down; everything session-scoped is cleared.
     pub fn on_disconnected(&mut self, out: &mut EventOut, tsc: u64) {
-        for f in self.confirmed.iter() {
-            out.emit(MdEvent::status(f, FeedStatus::Down, tsc));
+        for s in self.confirmed.iter() {
+            out.emit(self.status(s, StreamStatus::Down, tsc));
         }
         self.reset_session();
         self.next_batch = usize::MAX;
     }
 
+    /// Status event for stream `s`, tagged with its market, instrument and data type.
+    fn status(&self, s: StreamId, status: StreamStatus, tsc: u64) -> MdEvent {
+        let (market, instrument, slot) = self.status_tag[s.index()];
+        MdEvent::status(market, instrument, slot, status, tsc)
+    }
+
     fn reset_session(&mut self) {
-        self.active.clear();
         self.confirmed.clear();
         self.pending_since.fill(None);
         self.pending_count = 0;
@@ -135,14 +147,13 @@ impl Subscriptions {
         } else {
             self.retry_queue.pop_front()?
         };
-        for k in 0..self.batches[i].feeds.len() {
-            let f = self.batches[i].feeds[k];
-            // On a retry, feeds of the batch that are already confirmed or pending stay as
+        for k in 0..self.batches[i].streams.len() {
+            let f = self.batches[i].streams[k];
+            // On a retry, streams of the batch that are already confirmed or pending stay as
             // they are (no second `Up`).
             if self.confirmed.contains(f) || self.pending_since[f.index()].is_some() {
                 continue;
             }
-            self.active.insert(f);
             self.pending_since[f.index()] = Some(now);
             self.pending_count += 1;
         }
@@ -166,7 +177,7 @@ impl Subscriptions {
         if self.pending_count != 0 {
             for i in 0..self.pending_since.len() {
                 if self.pending_since[i].is_some_and(|t| now.duration_since(t) >= ACK_TIMEOUT) {
-                    self.fail(FeedId(i as u16), out, tsc);
+                    self.fail(StreamId(i as u16), out, tsc);
                 }
             }
         }
@@ -181,16 +192,16 @@ impl Subscriptions {
         }
     }
 
-    /// Applies `op` to every feed of the batch with request id `id` (venues that ack by id).
-    fn for_request(&mut self, id: u64, mut op: impl FnMut(&mut Self, FeedId)) {
+    /// Applies `op` to every stream of the batch with request id `id` (venues that ack by id).
+    fn for_request(&mut self, id: u64, mut op: impl FnMut(&mut Self, StreamId)) {
         let Some(i) = self.batches.iter().position(|b| b.id == id) else { return };
-        for k in 0..self.batches[i].feeds.len() {
-            let f = self.batches[i].feeds[k];
+        for k in 0..self.batches[i].streams.len() {
+            let f = self.batches[i].streams[k];
             op(self, f);
         }
     }
 
-    fn clear_pending(&mut self, f: FeedId) -> bool {
+    fn clear_pending(&mut self, f: StreamId) -> bool {
         let was = self.pending_since[f.index()].take().is_some();
         if was {
             self.pending_count -= 1;
@@ -198,19 +209,18 @@ impl Subscriptions {
         was
     }
 
-    fn confirm(&mut self, f: FeedId, out: &mut EventOut, tsc: u64) {
+    fn confirm(&mut self, f: StreamId, out: &mut EventOut, tsc: u64) {
         if self.clear_pending(f) {
             self.confirmed.insert(f);
-            out.emit(MdEvent::status(f, FeedStatus::Up, tsc));
+            out.emit(self.status(f, StreamStatus::Up, tsc));
         }
     }
 
     /// Venue rejected `f` or did not confirm it in time: `Failed`, and its batch is scheduled
-    /// to be sent again after `RETRY_AFTER` (once per batch, however many feeds failed).
-    fn fail(&mut self, f: FeedId, out: &mut EventOut, tsc: u64) {
+    /// to be sent again after `RETRY_AFTER` (once per batch, however many streams failed).
+    fn fail(&mut self, f: StreamId, out: &mut EventOut, tsc: u64) {
         if self.clear_pending(f) {
-            self.active.remove(f);
-            out.emit(MdEvent::status(f, FeedStatus::Failed, tsc));
+            out.emit(self.status(f, StreamStatus::Failed, tsc));
             let b = self.batch_of[f.index()] as usize;
             if let Some(slot) = self.retry_at.get_mut(b)
                 && slot.is_none()

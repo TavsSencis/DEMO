@@ -78,8 +78,8 @@ pub fn path() -> PathBuf {
     std::env::var_os("GENESIS_CONFIG").map_or_else(|| PathBuf::from(DEFAULT_PATH), PathBuf::from)
 }
 
-/// Reads and checks the file. Returns the node config (feeds as dense ids, FeedId = feed
-/// order) and the canonical registry those ids refer to.
+/// Reads and checks the file. Returns the node config (feeds as dense ids, in file order) and
+/// the canonical registry those ids refer to.
 pub fn load(path: &Path) -> anyhow::Result<(NodeConfig, Registry)> {
     let text = std::fs::read_to_string(path).with_context(|| format!("read config {}", path.display()))?;
     let file: File = toml::from_str(&text).with_context(|| format!("parse config {}", path.display()))?;

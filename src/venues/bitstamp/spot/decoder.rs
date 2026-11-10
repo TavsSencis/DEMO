@@ -1,4 +1,4 @@
-//! [DATA PLANE] Hot path: Bitstamp JSON message -> channel -> route slot -> FeedId -> MdEvent(s).
+//! [DATA PLANE] Hot path: Bitstamp JSON message -> channel -> route slot -> (market, instrument) -> MdEvent(s).
 //! No allocation: values are read in place with the shape-aware scanner and decimal strings
 //! are converted straight to fixed-point mantissas at the venue instrument's scale (daily reference data). Book messages are
 //! parsed and emitted in one pass; a malformed level rewinds the unpublished events, so a
@@ -9,7 +9,7 @@ use crate::transport::ws::reader::MessageKind;
 use crate::data_plane::decimal::{parse_fixed, parse_u64};
 use crate::data_plane::json_scan::{StrPairs, container_field, raw_field, str_field};
 use crate::control_plane::configs_struct::MarketDataType;
-use crate::control_plane::identity::FeedId;
+use crate::control_plane::identity::{InstrumentId, MarketId, StreamId};
 use crate::control_plane::startup::resolver::{ConnectionPlan, StartupPlan};
 use crate::data_plane::events::{BookEmitter, EventKind, MdEvent, flags};
 use crate::data_plane::route_table::RouteTable;
@@ -25,7 +25,10 @@ enum Kind {
 /// Everything the decoder needs for one channel, indexed by route slot.
 #[derive(Clone, Copy)]
 struct Route {
-    feed: FeedId,
+    market: MarketId,
+    instrument: InstrumentId,
+    /// The channel's subscription; used only on the cold ack path.
+    stream: StreamId,
     kind: Kind,
     price_exp: i8,
     qty_exp: i8,
@@ -41,22 +44,30 @@ impl BitstampSpotHandler {
     pub fn new(plan: &StartupPlan, conn: &ConnectionPlan) -> anyhow::Result<Self> {
         let channels = RouteTable::new(&conn.route_keys).map_err(|e| anyhow::anyhow!("{}: {e:?}", conn.name))?;
         let mut routes = Vec::with_capacity(conn.routes.len());
-        for (slot, by_type) in conn.routes.iter().enumerate() {
+        for (slot, target) in conn.routes.iter().enumerate() {
             // Each Bitstamp channel carries exactly one data type.
-            let feed = by_type
+            let stream = target
+                .streams
                 .iter()
                 .flatten()
                 .next()
                 .copied()
-                .ok_or_else(|| anyhow::anyhow!("{}: channel {} has no feed", conn.name, conn.route_keys[slot]))?;
-            let spec = plan.feed(feed);
+                .ok_or_else(|| anyhow::anyhow!("{}: channel {} has no stream", conn.name, conn.route_keys[slot]))?;
+            let spec = plan.stream(stream);
             let kind = match spec.data_type {
                 MarketDataType::Trade => Kind::Trade,
                 MarketDataType::OrderBookSnapshot { .. } => Kind::Snapshot,
                 MarketDataType::OrderBookDelta => Kind::Delta,
                 MarketDataType::Quote => anyhow::bail!("{}: Bitstamp has no quote channel", conn.name),
             };
-            routes.push(Route { feed, kind, price_exp: spec.price_exp, qty_exp: spec.qty_exp });
+            routes.push(Route {
+                market: target.market,
+                instrument: target.instrument,
+                stream,
+                kind,
+                price_exp: target.price_exp,
+                qty_exp: target.qty_exp,
+            });
         }
         Ok(Self { channels, routes: routes.into_boxed_slice() })
     }
@@ -89,9 +100,6 @@ impl VenueHandler for BitstampSpotHandler {
 
         let Some(slot) = self.channels.lookup(channel) else { return };
         let r = self.routes[slot];
-        if !ctx.active.contains(r.feed) {
-            return;
-        }
         let Some(data) = data else { return };
         // A malformed message emits nothing.
         match r.kind {
@@ -107,10 +115,10 @@ impl BitstampSpotHandler {
     #[cold]
     #[inline(never)]
     fn on_control(&self, event: &[u8], channel: &[u8], ctx: &mut EmitCtx<'_>) {
-        let feed = || self.channels.lookup(channel).map(|s| self.routes[s].feed);
+        let stream = || self.channels.lookup(channel).map(|s| self.routes[s].stream);
         match event {
             b"bts:subscription_succeeded" => {
-                if let Some(f) = feed() {
+                if let Some(f) = stream() {
                     ctx.control.ack(Ack::Subscribed(f));
                 }
             }
@@ -132,7 +140,7 @@ fn emit_trade(r: Route, data: &[u8], ctx: &mut EmitCtx<'_>) {
     ) else {
         return;
     };
-    let mut e = MdEvent::new(r.feed, EventKind::Trade, ctx.recv_tsc);
+    let mut e = MdEvent::new(r.market, r.instrument, EventKind::Trade, ctx.recv_tsc);
     e.exch_ts_us = ts as i64;
     e.seq = id as i64;
     e.px = px;
@@ -155,7 +163,7 @@ fn emit_book(r: Route, kind: EventKind, data: &[u8], ctx: &mut EmitCtx<'_>) {
     ) else {
         return;
     };
-    let mut base = MdEvent::new(r.feed, kind, ctx.recv_tsc);
+    let mut base = MdEvent::new(r.market, r.instrument, kind, ctx.recv_tsc);
     base.exch_ts_us = ts as i64;
     base.seq = ts as i64;
     base.price_exp = r.price_exp;

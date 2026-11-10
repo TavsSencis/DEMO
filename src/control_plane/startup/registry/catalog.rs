@@ -34,7 +34,7 @@ impl Registry {
             }
             let base = reg.currency_id(&key.base);
             let quote = reg.currency_id(&key.quote);
-            let id = InstrumentId(reg.instruments.len() as u32);
+            let id = InstrumentId(reg.instruments.len() as u16);
             reg.instruments.push(InstrumentDefinition { id, kind: key.kind, base, quote });
         }
         reg

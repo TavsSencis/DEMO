@@ -84,7 +84,6 @@ impl<V: Venue> WsHandler for Session<V> {
     fn on_message(&mut self, kind: MessageKind, payload: &[u8], recv_tsc: u64) -> bool {
         let mut ctx = EmitCtx {
             recv_tsc,
-            active: &self.subs.active,
             out: &mut self.out,
             control: &mut self.control,
         };

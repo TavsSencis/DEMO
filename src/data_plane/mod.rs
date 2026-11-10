@@ -1,6 +1,6 @@
-//! [DATA PLANE] Code that runs for every message, on the pinned connection threads:
+//! [DATA PLANE] Code that runs for every message, on the connection threads:
 //! `session` (per-message dispatch), normalized `events` and their SPSC rings, routing
-//! (`route_table`, `feed_set`) and zero-allocation parsing helpers (`decimal`, `json_scan`).
+//! (`route_table`) and zero-allocation parsing helpers (`decimal`, `json_scan`).
 //!
 //! Rules (enforced by clippy, see `clippy.toml`): no heap allocation, formatting, printing,
 //! locks, sleeping or clock syscalls. Startup constructors are explicitly allowed one by one.
@@ -9,7 +9,6 @@
 
 pub mod decimal;
 pub mod events;
-pub mod feed_set;
 pub mod json_scan;
 pub mod route_table;
 pub mod session;

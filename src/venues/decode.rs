@@ -3,17 +3,16 @@
 //! for the control plane to handle on a cold branch.
 #![deny(clippy::disallowed_methods, clippy::disallowed_macros)]
 
-use crate::control_plane::identity::FeedId;
+use crate::control_plane::identity::StreamId;
 use crate::data_plane::events::EventOut;
-use crate::data_plane::feed_set::FeedSet;
 use crate::transport::ws::reader::MessageKind;
 
 /// Venue response to a request, reported by the decoder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ack {
-    /// Venue confirms by channel (Bitstamp): this feed is subscribed.
-    Subscribed(FeedId),
-    /// Venue confirms by request id (Binance): every feed of that request.
+    /// Venue confirms by channel (Bitstamp): this stream is subscribed.
+    Subscribed(StreamId),
+    /// Venue confirms by request id (Binance): every stream of that request.
     RequestOk(u64),
     RequestFailed(u64),
     /// Error that cannot be attributed to a request; pending subscriptions will time out.
@@ -61,8 +60,6 @@ impl Control {
 /// What a decoder may touch while handling one message.
 pub struct EmitCtx<'a> {
     pub recv_tsc: u64,
-    /// Feeds whose subscribe went out on this session; others are dropped.
-    pub active: &'a FeedSet,
     pub out: &'a mut EventOut,
     pub control: &'a mut Control,
 }

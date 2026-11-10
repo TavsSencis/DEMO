@@ -1,4 +1,4 @@
-//! [DATA PLANE] Hot path: Binance SBE message -> symbol slot -> FeedId -> MdEvent(s).
+//! [DATA PLANE] Hot path: Binance SBE message -> symbol slot -> (market, instrument) -> MdEvent(s).
 //! No allocation, no strings, no locks. Lookups: one hash probe + one array index.
 //! Text frames are request responses (`{"result":null,"id":N}` or an error with the id),
 //! reported as acks to the subscription state.
@@ -9,47 +9,40 @@ use super::sbe::codec::{Group, levels};
 use crate::transport::ws::reader::MessageKind;
 use crate::data_plane::decimal::parse_u64;
 use crate::data_plane::json_scan::raw_field;
-use crate::control_plane::configs_struct::{DATA_TYPE_SLOTS, MarketDataType};
-use crate::control_plane::identity::FeedId;
+use crate::control_plane::identity::{InstrumentId, MarketId};
 use crate::control_plane::startup::resolver::ConnectionPlan;
 use crate::data_plane::events::{EventKind, MdEvent, flags};
 use crate::data_plane::route_table::RouteTable;
 use crate::venues::{Ack, EmitCtx, VenueHandler};
 
-const NO_FEED: u16 = u16::MAX;
-const SLOT_QUOTE: usize = MarketDataType::Quote.slot();
-const SLOT_TRADE: usize = MarketDataType::Trade.slot();
-const SLOT_SNAPSHOT: usize = MarketDataType::OrderBookSnapshot { depth: 0 }.slot();
-const SLOT_DELTA: usize = MarketDataType::OrderBookDelta.slot();
+/// What a symbol resolves to: the market every event of that symbol is tagged with.
+#[derive(Clone, Copy)]
+struct Target {
+    market: MarketId,
+    instrument: InstrumentId,
+}
 
 pub struct BinanceSpotHandler {
     symbols: RouteTable,
-    /// `routes[symbol_slot][data_type_slot]` -> feed id or NO_FEED.
-    routes: Box<[[u16; DATA_TYPE_SLOTS]]>,
+    /// `routes[symbol_slot]`.
+    routes: Box<[Target]>,
 }
 
 impl BinanceSpotHandler {
     #[allow(clippy::disallowed_methods, clippy::disallowed_macros)] // control plane: runs once at startup
     pub fn new(plan: &ConnectionPlan) -> anyhow::Result<Self> {
         let symbols = RouteTable::new(&plan.route_keys).map_err(|e| anyhow::anyhow!("{}: {e:?}", plan.name))?;
-        let routes = plan
-            .routes
-            .iter()
-            .map(|r| r.map(|f| f.map_or(NO_FEED, |f| f.0)))
-            .collect();
+        let routes = plan.routes.iter().map(|r| Target { market: r.market, instrument: r.instrument }).collect();
         Ok(Self { symbols, routes })
     }
 
+    /// Symbol bytes -> market. `None` for a symbol this connection does not carry. Stream
+    /// status (subscribed, confirmed) is the control plane's concern; consumers gate on it.
     #[inline(always)]
-    fn route(&self, symbol: &[u8], data_slot: usize, ctx: &mut EmitCtx<'_>) -> Option<FeedId> {
+    fn route(&self, symbol: &[u8]) -> Option<Target> {
         let sym = self.symbols.lookup(symbol)?;
         // sym < routes.len() by construction (table built from the same plan).
-        let raw = self.routes.get(sym)?[data_slot];
-        let feed = FeedId(raw);
-        if raw == NO_FEED || !ctx.active.contains(feed) {
-            return None;
-        }
-        Some(feed)
+        self.routes.get(sym).copied()
     }
 }
 
@@ -65,8 +58,8 @@ impl VenueHandler for BinanceSpotHandler {
 
         match msg {
             BinanceSbeMsg::BestBidAsk(q) => {
-                let Some(feed) = self.route(q.symbol, SLOT_QUOTE, ctx) else { return };
-                let mut e = MdEvent::new(feed, EventKind::Quote, t);
+                let Some(m) = self.route(q.symbol) else { return };
+                let mut e = MdEvent::new(m.market, m.instrument, EventKind::Quote, t);
                 e.exch_ts_us = q.event_time_us;
                 e.seq = q.book_update_id;
                 e.px = q.bid_price;
@@ -78,9 +71,9 @@ impl VenueHandler for BinanceSpotHandler {
                 ctx.out.emit(e);
             }
             BinanceSbeMsg::Trades(tr) => {
-                let Some(feed) = self.route(tr.symbol, SLOT_TRADE, ctx) else { return };
+                let Some(m) = self.route(tr.symbol) else { return };
                 for x in tr.iter() {
-                    let mut e = MdEvent::new(feed, EventKind::Trade, t);
+                    let mut e = MdEvent::new(m.market, m.instrument, EventKind::Trade, t);
                     e.exch_ts_us = tr.event_time_us;
                     e.seq = x.id;
                     e.px = x.price;
@@ -93,8 +86,8 @@ impl VenueHandler for BinanceSpotHandler {
                 }
             }
             BinanceSbeMsg::DepthSnapshot(d) => {
-                let Some(feed) = self.route(d.symbol, SLOT_SNAPSHOT, ctx) else { return };
-                let mut base = MdEvent::new(feed, EventKind::BookSnapshot, t);
+                let Some(m) = self.route(d.symbol) else { return };
+                let mut base = MdEvent::new(m.market, m.instrument, EventKind::BookSnapshot, t);
                 base.exch_ts_us = d.event_time_us;
                 base.seq = d.book_update_id;
                 base.price_exp = d.price_exponent;
@@ -102,8 +95,8 @@ impl VenueHandler for BinanceSpotHandler {
                 emit_book(base, d.bids, d.asks, ctx);
             }
             BinanceSbeMsg::DepthDiff(d) => {
-                let Some(feed) = self.route(d.symbol, SLOT_DELTA, ctx) else { return };
-                let mut base = MdEvent::new(feed, EventKind::BookDelta, t);
+                let Some(m) = self.route(d.symbol) else { return };
+                let mut base = MdEvent::new(m.market, m.instrument, EventKind::BookDelta, t);
                 base.exch_ts_us = d.event_time_us;
                 base.seq = d.last_book_update_id;
                 base.aux0 = d.first_book_update_id;
